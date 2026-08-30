@@ -1,0 +1,19 @@
+ Easy (session or less each):
+XXX  - Estimated time on extraction — 7z outputs progress percentages, we already parse its output; just do some math on elapsed time
+  vs. % complete
+nope  - Split-archive from context menu — wire the existing create dialog params to a right-click, maybe 30 minutes
+
+  Medium (1-2 sessions, similar to drag-out):
+XXX  - Remember passwords — QSettings store per-archive-path, add a "save password" checkbox to the extract dialog; straightforward but
+  needs care around security
+XXX  - Copy between tabs — extract selected to temp, add to other tab's archive; the tab architecture makes this possible now, maybe a
+  session
+
+  Hard (comparable to tabs refactor):
+XXX  - Progress with ETA — 7z's percentage output is inconsistent across operations and formats; making it reliable and not jumpy is
+  harder than it looks
+
+  Not worth it:
+  - RAR/ISO write — licensing wall, not a code problem
+
+

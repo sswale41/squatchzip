@@ -1,0 +1,28 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=KonqPopupMenu/Plugin
+MimeType=all/all;
+Actions=squatchzip_open;squatchzip_create;squatchzip_create_delete;squatchzip_extract_here;
+X-KDE-Submenu=SquatchZip
+X-KDE-Icon=squatchzip
+X-KDE-Priority=TopLevel
+
+[Desktop Action squatchzip_open]
+Name=Open with SquatchZip
+Icon=archive-manager
+Exec=squatchzip %f
+
+[Desktop Action squatchzip_create]
+Name=Archive Selected Files…
+Icon=document-new
+Exec=squatchzip --new %F
+
+[Desktop Action squatchzip_create_delete]
+Name=Archive and Delete Originals…
+Icon=edit-delete
+Exec=squatchzip --new --delete %F
+
+[Desktop Action squatchzip_extract_here]
+Name=Extract Here
+Icon=archive-extract
+Exec=squatchzip --extract-here %f
