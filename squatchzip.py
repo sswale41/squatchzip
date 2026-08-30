@@ -11,6 +11,7 @@ import os
 import re
 import glob
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -26,7 +27,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QSpinBox,
     QTextEdit, QAbstractItemView, QHeaderView, QFrame,
     QDialog, QDialogButtonBox, QInputDialog, QMenu,
-    QSplitter, QStackedWidget, QTreeView, QTabWidget, QProgressBar,
+    QSplitter, QStackedWidget, QTreeView, QTabWidget, QTabBar, QProgressBar,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QSize, QSettings, QDir, QTimer,
@@ -35,7 +36,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QAction, QIcon, QFont, QDragEnterEvent, QDropEvent, QCursor, QFileSystemModel, QPixmap
 
 # ─────────────────────────────────────────────────────
-VERSION  = "2.2.1"
+VERSION  = "2.3.0"
 APP_NAME = "SquatchZip"
 ORG_NAME = "SquatchLabs"
 
@@ -87,31 +88,134 @@ ICON_EXT_MAP = {
 #  Worker Thread
 # ═════════════════════════════════════════════════════
 
+# 7z reports a missing/incorrect password through its normal output, not a
+# distinct exit code, so callers have to sniff for it.
+#
+# _LIST: broad.  A false positive only re-prompts for a password, which is
+# harmless, and "encrypted" is how 7z labels a header-encrypted archive.
+# _TEST:  narrow.  A corrupt *encrypted* archive also mentions "encrypted" in
+# its error output, and calling that a password problem would send the user
+# looking for the wrong thing.
+_PW_MARKERS_LIST = ("encrypted", "enter password", "wrong password")
+_PW_MARKERS_TEST = ("enter password", "wrong password", "can not open encrypted")
+
+
+class OperationCancelled(Exception):
+    """Raised inside a worker when the user cancels the running 7z process."""
+
+
+# gzip, bzip2 and xz each wrap a *single* stream, so 7-Zip cannot build a
+# .tar.gz in one pass.  Given several inputs it fails outright with E_INVALIDARG;
+# given exactly one it silently writes a plain gzip under a .tar.gz name, which
+# no tar can unpack.  These formats need an explicit tar stage on the way in and
+# a second extract pass on the way out.
+_TAR_COMPOUND_SUFFIXES = (
+    ".tar.gz", ".tar.bz2", ".tar.xz",
+    ".tgz", ".tbz2", ".tbz", ".txz",
+)
+
+
+def _tar_compound_suffix(path):
+    """The matched suffix if path is a tar-then-compress archive, else None."""
+    low = path.lower()
+    # Longest first, so ".tar.gz" wins over a bare ".gz" check elsewhere.
+    for suf in sorted(_TAR_COMPOUND_SUFFIXES, key=len, reverse=True):
+        if low.endswith(suf):
+            return suf
+    return None
+
+
+def _entry_is_dir(entry):
+    """True if a "7z l -slt" entry is a directory.
+
+    7-Zip describes this differently per format: .7z and .zip use
+    "Attributes = D ...", while tar uses "Folder = +" and "Mode = drwx...".
+    Checking only Attributes counted every directory in a tar as a file.
+    """
+    if "D" in (entry.get("Attributes") or ""):
+        return True
+    if (entry.get("Folder") or "").strip() == "+":
+        return True
+    if (entry.get("Mode") or "").startswith("d"):
+        return True
+    return (entry.get("Path") or "").endswith("/")
+
+
+def _archive_part_paths(path):
+    """Every on-disk file belonging to an archive: the base name plus any
+    multi-volume parts (name.7z.001…, name.part1.rar…).  A split archive has
+    no file at the base name at all, so callers must not assume it exists."""
+    paths = [path] if os.path.exists(path) else []
+    paths += sorted(glob.glob(f"{path}.[0-9][0-9][0-9]"))
+    stem = path[:-4] if path.lower().endswith(".rar") else path
+    paths += sorted(glob.glob(f"{stem}.part*.rar"))
+    return paths
+
+
 class ArchiveWorker(QThread):
     progress     = pyqtSignal(str)
     progress_pct = pyqtSignal(int)   # 0-100, emitted during create/extract
-    finished     = pyqtSignal(bool, str)
+    op_finished  = pyqtSignal(bool, str)   # NOT 'finished' — QThread owns that name
     listing      = pyqtSignal(list)
 
     def __init__(self, operation, **kwargs):
         super().__init__()
         self.operation = operation
         self.kwargs    = kwargs
+        self._proc      = None    # the 7z process currently running, if any
+        self._cancelled = False
+        self._created_archive = None   # set by _create when it makes a new file
+        self._stage_dir       = None   # scratch dir for the .tar.gz tar stage
 
     def run(self):
         try:
             getattr(self, f"_{self.operation}")()
+        except OperationCancelled:
+            self._cancel_cleanup()
+            self.op_finished.emit(False, "Cancelled.")
         except Exception as exc:
-            self.finished.emit(False, str(exc))
+            self.op_finished.emit(False, str(exc))
+
+    def cancel(self):
+        """Stop the running 7z process.  Called from the GUI thread."""
+        self._cancelled = True
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            # start_new_session=True put 7z in its own process group, so this
+            # also reaps any helper it spawned.
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except OSError:
+            pass
+
+    def _cancel_cleanup(self):
+        """Delete a half-written archive after a cancelled create.  Only ever
+        touches a file this worker created — never one it was appending to."""
+        if self._stage_dir:
+            shutil.rmtree(self._stage_dir, ignore_errors=True)
+            self._stage_dir = None
+        if not self._created_archive:
+            return
+        for p in _archive_part_paths(self._created_archive):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
     # ── internal helpers ──────────────────────────────
 
     def _run(self, cmd, cwd=None, track_pct=False):
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            # DEVNULL, never the inherited tty: 7z prompts "Enter password:" on
+            # stdin whenever it needs one we did not supply, and would otherwise
+            # block forever behind a modal dialog.  At EOF it exits non-zero.
+            stdin=subprocess.DEVNULL,
             bufsize=0, cwd=cwd,
             start_new_session=True,  # isolate from terminal SIGINT/SIGHUP
         )
+        self._proc = proc
         lines = []
         buf = b""
         last_pct = 0
@@ -152,6 +256,9 @@ class ArchiveWorker(QThread):
                     lines.append(line)
 
         proc.wait()
+        self._proc = None
+        if self._cancelled:
+            raise OperationCancelled()
         return proc.returncode, lines
 
     # ── operations ────────────────────────────────────
@@ -164,19 +271,28 @@ class ArchiveWorker(QThread):
             cmd += [f"-p{password}"]
         rc, lines = self._run(cmd)
         if rc not in (0, 1):
-            if any("encrypted" in l.lower() or "enter password" in l.lower()
-                   for l in lines):
-                self.finished.emit(False, "__ENCRYPTED__")
+            if any(m in l.lower() for l in lines for m in _PW_MARKERS_LIST):
+                self.op_finished.emit(False, "__ENCRYPTED__")
             else:
-                self.finished.emit(False, "Failed to list archive contents.")
+                self.op_finished.emit(False, "Failed to list archive contents.")
             return
+        # "7z l -slt" opens with a header block describing the archive itself
+        # ("Path = <the archive>", Type, Method, Solid…) before the first
+        # ---------- separator.  Treating that as an entry added a phantom row
+        # to the tree, inflated the file count by one, and — because its Path is
+        # the archive's own absolute path — fed a bogus root name into
+        # _should_create_subfolder(), so that heuristic almost always said
+        # "wrap" and Extract double-nested.
         files, current = [], {}
+        in_entries = False
         for line in lines:
             if line.startswith("----------"):
-                if current:
+                if not in_entries:
+                    in_entries = True      # header block ends here; discard it
+                elif current:
                     files.append(current)
-                    current = {}
-            elif "=" in line:
+                current = {}
+            elif in_entries and "=" in line:
                 k, _, v = line.partition("=")
                 key = k.strip()
                 if key == "Path" and "Path" in current:
@@ -184,10 +300,10 @@ class ArchiveWorker(QThread):
                     files.append(current)
                     current = {}
                 current[key] = v.strip()
-        if current:
+        if in_entries and current:
             files.append(current)
         self.listing.emit(files)
-        self.finished.emit(True, f"Loaded {len(files)} entries.")
+        self.op_finished.emit(True, f"Loaded {len(files)} entries.")
 
     def _create(self):
         archive     = str(Path(self.kwargs["archive"]).resolve())  # must be abs before cwd changes
@@ -213,28 +329,69 @@ class ArchiveWorker(QThread):
             work_cwd    = None
             rel_sources = sources_abs
 
+        # A .tar.gz / .tar.bz2 / .tar.xz is built in two steps: tar the sources
+        # into a scratch dir, then compress that single file.  Everything below
+        # therefore targets the inner .tar, and _finish_tar_compound() runs the
+        # compression stage afterwards.
+        final_archive = archive
+        tar_suffix    = _tar_compound_suffix(archive)
+        self._stage_dir = None
+        if tar_suffix:
+            if not _archive_part_paths(final_archive):
+                self._created_archive = final_archive
+            self._stage_dir = tempfile.mkdtemp(prefix="squatchzip_tar_")
+            archive = os.path.join(
+                self._stage_dir, Path(final_archive).name[:-len(tar_suffix)] + ".tar"
+            )
+            if password:
+                # None of gzip, bzip2 or xz can encrypt.  Silently dropping the
+                # password would hand back an archive the user thinks is locked.
+                self.progress.emit(
+                    "⚠ Password ignored — gzip/bzip2/xz cannot encrypt. "
+                    "Use .7z or .zip if you need an encrypted archive."
+                )
+                password = ""
+
         # -bsp1 breaks pipeline formats (gz/bz2/xz use a two-stage internal stream)
         _arc_lower = archive.lower()
         _bsp = [] if any(_arc_lower.endswith(e) for e in ('.gz', '.bz2', '.xz')) else ['-bsp1']
-        cmd = ["7z", "a"] + _bsp + [f"-mx={level}"]
-        if not solid:
-            cmd += ["-ms=off"]
-        elif _arc_lower.endswith(".7z"):
-            # LZMA2 uses ~11× dictionary per encoder thread (~700 MB/thread at -mx=9).
-            # 16 threads × 700 MB = 11 GB encoder state alone — earlyoom kills it.
-            # Cap at 4 threads: 4 × 700 MB + 2 GB solid block ≈ 5 GB total. Thread
-            # count doesn't affect compression ratio, only speed.
-            cmd += ["-ms=2g", "-mmt=4"]
+        _is_7z = _arc_lower.endswith(".7z")
+
+        # Remember a brand-new archive so a cancel can clean up the partial file.
+        # Appending to an existing archive must never mark it for deletion.
+        if not tar_suffix and not _archive_part_paths(archive):
+            self._created_archive = archive
+
+        cmd = ["7z", "a"] + _bsp
+        if tar_suffix:
+            # The tar stage only bundles; -mx belongs on the compression stage.
+            cmd += ["-ttar"]
+        else:
+            cmd += [f"-mx={level}"]
+        # -ms (solid mode) is a 7z-only switch.  zip/tar/gz reject it outright
+        # with E_INVALIDARG and rc=2, so it must never be sent for them — and
+        # 'solid' is a persisted setting, so an unchecked box used to break
+        # every non-7z create and every "add to archive" until it was re-checked.
+        if _is_7z:
+            if not solid:
+                cmd += ["-ms=off"]
+            else:
+                # LZMA2 uses ~11× dictionary per encoder thread (~700 MB/thread at -mx=9).
+                # 16 threads × 700 MB = 11 GB encoder state alone — earlyoom kills it.
+                # Cap at 4 threads: 4 × 700 MB + 2 GB solid block ≈ 5 GB total. Thread
+                # count doesn't affect compression ratio, only speed.
+                cmd += ["-ms=2g", "-mmt=4"]
         if password:
             cmd += [f"-p{password}"]
-            if archive.endswith(".7z"):
+            if _is_7z:                   # _arc_lower, so "Backup.7Z" counts too
                 cmd += ["-mhe=on"]       # encrypt header too
-        if split_size > 0:
+        if split_size > 0 and not tar_suffix:
             cmd += [f"-v{split_size}{split_unit}"]
         if excl_hidden:
             cmd += ["-xr!.*"]            # exclude dot-files/folders
         cmd += [archive] + rel_sources
 
+        symlinks_excluded = False
         rc, lines = self._run(cmd, cwd=work_cwd, track_pct=bool(_bsp))
         if rc != 0:
             # Detect NTFS junction-point / symlink-loop errors (errno=40, ELOOP).
@@ -251,19 +408,46 @@ class ArchiveWorker(QThread):
                 retry_cmd = cmd + ["-xr!@"]
                 rc, _ = self._run(retry_cmd, cwd=work_cwd, track_pct=bool(_bsp))
                 if rc != 0:
-                    self.finished.emit(
+                    self.op_finished.emit(
                         False,
                         "Archive creation failed even after excluding symbolic links — "
                         "see log for details."
                     )
                     return
                 # Fall through to success path; note symlinks were skipped.
+                symlinks_excluded = True
                 msg_suffix = " (symbolic links excluded — NTFS junction points skipped)"
             else:
-                self.finished.emit(False, "Archive creation failed — see log for details.")
+                self.op_finished.emit(False, "Archive creation failed — see log for details.")
                 return
         else:
             msg_suffix = ""
+
+        if tar_suffix:
+            ok, err = self._finish_tar_compound(
+                archive, final_archive, level, split_size, split_unit
+            )
+            if not ok:
+                self.op_finished.emit(False, err)
+                return
+            archive = final_archive
+
+        # The archive may hold less than the source tree: -xr!.* dropped every
+        # dot-file, and the ELOOP retry dropped every symlink.  Deleting the
+        # sources in that case destroys data that was never archived.
+        _excluded = []
+        if excl_hidden:
+            _excluded.append("hidden files")
+        if symlinks_excluded:
+            _excluded.append("symbolic links")
+        if delete_src and _excluded:
+            delete_src = False
+            _kept_reason = " and ".join(_excluded)
+            self.progress.emit(
+                f"⚠ Source files NOT deleted — the archive excludes {_kept_reason}, "
+                "so deleting the sources would lose data that was never archived."
+            )
+            msg_suffix += f" — sources kept (archive excludes {_kept_reason})"
 
         deleted, errors = 0, 0
         if delete_src:
@@ -282,7 +466,32 @@ class ArchiveWorker(QThread):
                 msg += f" ({errors} deletion error(s) — see log.)"
         else:
             msg = f"Archive created successfully.{msg_suffix}"
-        self.finished.emit(True, msg)
+        self.op_finished.emit(True, msg)
+
+    def _finish_tar_compound(self, tar_path, final_archive, level,
+                             split_size, split_unit):
+        """Compress the staged .tar into the requested .tar.gz/.bz2/.xz.
+
+        Returns (ok, error_message).  The scratch directory is always removed.
+        """
+        try:
+            self.progress.emit("── Compressing archive ──")
+            self.progress_pct.emit(0)
+            cmd = ["7z", "a", f"-mx={level}"]
+            if split_size > 0:
+                cmd += [f"-v{split_size}{split_unit}"]
+            # -bsp1 is omitted: gz/bz2/xz drive a second internal stream and the
+            # switch makes 7z emit progress for the wrong stage.
+            cmd += [final_archive, tar_path]
+            rc, _ = self._run(cmd, cwd=os.path.dirname(tar_path))
+            if rc != 0:
+                return False, "Archive created, but compressing it failed — see log."
+            self.progress_pct.emit(100)
+            return True, ""
+        finally:
+            if self._stage_dir:
+                shutil.rmtree(self._stage_dir, ignore_errors=True)
+                self._stage_dir = None
 
     def _extract(self):
         archive   = self.kwargs["archive"]
@@ -301,14 +510,53 @@ class ArchiveWorker(QThread):
             cmd += paths   # 7z accepts archive-internal paths as trailing args
 
         rc, _ = self._run(cmd, track_pct=True)
-        if rc == 0:
-            self.finished.emit(True, f"Extracted to: {dest}")
-        elif rc == 1:
+        if rc not in (0, 1):
+            self.op_finished.emit(False, "Extraction failed — see log.")
+            return
+
+        # A .tar.gz unpacks to a bare .tar — one more pass gets the actual files.
+        if _tar_compound_suffix(archive):
+            ok, err = self._unwrap_inner_tar(dest, archive, mode, overwrite)
+            if not ok:
+                self.op_finished.emit(False, err)
+                return
+
+        if rc == 1:
             # 7z exit code 1 = non-fatal warnings (e.g. locked files, minor issues).
             # Extraction completed; surface the warning rather than treating as failure.
-            self.finished.emit(True, f"Extracted to: {dest} (warnings — see log)")
+            self.op_finished.emit(True, f"Extracted to: {dest} (warnings — see log)")
         else:
-            self.finished.emit(False, "Extraction failed — see log.")
+            self.op_finished.emit(True, f"Extracted to: {dest}")
+
+    def _unwrap_inner_tar(self, dest, archive, mode="x", overwrite=True):
+        """Unpack the .tar that a .tar.gz/.tar.bz2/.tar.xz extracts to, then
+        remove it, so the user is left with their files rather than a tarball.
+
+        Returns (ok, error_message).
+        """
+        suffix = _tar_compound_suffix(archive)
+        inner  = os.path.join(dest, Path(archive).name[:-len(suffix)] + ".tar")
+        if not os.path.exists(inner):
+            # The inner member is not always named after the archive.  Only act
+            # when there is exactly one candidate, so we never guess wrong.
+            candidates = glob.glob(os.path.join(dest, "*.tar"))
+            if len(candidates) != 1:
+                return True, ""      # nothing unambiguous to unwrap; leave it
+            inner = candidates[0]
+
+        self.progress.emit("── Unpacking inner tar ──")
+        self.progress_pct.emit(0)
+        cmd = ["7z", mode, "-bsp1", inner, f"-o{dest}"]
+        if overwrite:
+            cmd += ["-y"]
+        rc, _ = self._run(cmd, track_pct=True)
+        if rc not in (0, 1):
+            return False, "Decompressed the archive, but unpacking the tar failed — see log."
+        try:
+            os.remove(inner)
+        except OSError:
+            pass
+        return True, ""
 
     def _test(self):
         archive  = self.kwargs["archive"]
@@ -316,28 +564,38 @@ class ArchiveWorker(QThread):
         cmd = ["7z", "t", archive]
         if password:
             cmd += [f"-p{password}"]
-        rc, _ = self._run(cmd)
+        rc, lines = self._run(cmd)
         if rc == 0:
-            self.finished.emit(True, "✓ Archive integrity OK — no errors found.")
+            self.op_finished.emit(True, "✓ Archive integrity OK — no errors found.")
+        elif any(m in l.lower() for l in lines for m in _PW_MARKERS_TEST):
+            # Reporting this as corruption sends people hunting a damaged file.
+            self.op_finished.emit(
+                False, "🔒 Wrong or missing password — cannot test this archive."
+            )
         else:
-            self.finished.emit(False, "✗ Archive test FAILED — errors detected!")
+            self.op_finished.emit(False, "✗ Archive test FAILED — errors detected!")
 
     def _delete(self):
-        archive = self.kwargs["archive"]
-        paths   = self.kwargs["paths"]
-        cmd = ["7z", "d", archive] + paths
+        archive  = self.kwargs["archive"]
+        paths    = self.kwargs["paths"]
+        password = self.kwargs.get("password", "")
+        cmd = ["7z", "d", archive]
+        if password:
+            cmd += [f"-p{password}"]
+        cmd += paths
         rc, _ = self._run(cmd)
         n = len(paths)
         if rc == 0:
-            self.finished.emit(True, f"Deleted {n} item(s) from archive.")
+            self.op_finished.emit(True, f"Deleted {n} item(s) from archive.")
         else:
-            self.finished.emit(False, "Delete failed — see log.")
+            self.op_finished.emit(False, "Delete failed — see log.")
 
     def _copy_to_archive(self):
         src_archive = self.kwargs["src_archive"]
         src_paths   = self.kwargs["src_paths"]
         dst_archive = self.kwargs["dst_archive"]
-        password    = self.kwargs.get("password", "")
+        password     = self.kwargs.get("password", "")       # source archive
+        dst_password = self.kwargs.get("dst_password", "")   # destination archive
 
         tmp = tempfile.mkdtemp(prefix="squatchzip_copy_")
         try:
@@ -348,21 +606,28 @@ class ArchiveWorker(QThread):
             cmd += src_paths
             rc, _ = self._run(cmd, track_pct=True)
             if rc not in (0, 1):
-                self.finished.emit(False, "Copy failed — could not extract from source archive.")
+                self.op_finished.emit(False, "Copy failed — could not extract from source archive.")
                 return
 
             self.progress.emit("── Phase 2: adding to destination ──")
             self.progress_pct.emit(0)   # reset bar for phase 2
             dst_lower = dst_archive.lower()
             _bsp = [] if any(dst_lower.endswith(e) for e in ('.gz', '.bz2', '.xz')) else ['-bsp1']
-            cmd = ["7z", "a"] + _bsp + [dst_archive, "."]
+            cmd = ["7z", "a"] + _bsp + [dst_archive]
+            if dst_password:
+                # Without this, copying into an encrypted archive silently wrote
+                # the new entries in the clear.
+                cmd += [f"-p{dst_password}"]
+                if dst_lower.endswith(".7z"):
+                    cmd += ["-mhe=on"]
+            cmd += ["."]
             rc, _ = self._run(cmd, cwd=tmp, track_pct=bool(_bsp))
             if rc not in (0, 1):
-                self.finished.emit(False, "Copy failed — could not add to destination archive.")
+                self.op_finished.emit(False, "Copy failed — could not add to destination archive.")
                 return
 
             n = len(src_paths)
-            self.finished.emit(True, f"Copied {n} item(s) to {Path(dst_archive).name}.")
+            self.op_finished.emit(True, f"Copied {n} item(s) to {Path(dst_archive).name}.")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -370,12 +635,16 @@ class ArchiveWorker(QThread):
         archive  = self.kwargs["archive"]
         old_name = self.kwargs["old_name"]
         new_name = self.kwargs["new_name"]
-        cmd = ["7z", "rn", archive, old_name, new_name]
+        password = self.kwargs.get("password", "")
+        cmd = ["7z", "rn", archive]
+        if password:
+            cmd += [f"-p{password}"]
+        cmd += [old_name, new_name]
         rc, _ = self._run(cmd)
         if rc == 0:
-            self.finished.emit(True, f"Renamed to \"{Path(new_name).name}\".")
+            self.op_finished.emit(True, f"Renamed to \"{Path(new_name).name}\".")
         else:
-            self.finished.emit(False, "Rename failed — see log.")
+            self.op_finished.emit(False, "Rename failed — see log.")
 
 
 # ═════════════════════════════════════════════════════
@@ -388,8 +657,12 @@ class ProgressDialog(QDialog):
         self.setWindowTitle(title)
         self.setMinimumSize(560, 300)
         self.setModal(True)
-        self._operation_done = False   # True once finish() is called
-        self._start_time     = None    # set on first non-zero progress_pct
+        self._operation_done   = False   # True once finish() is called
+        self._cancel_requested = False
+        self._worker           = None    # set by set_worker(); powers Cancel
+        # Clock starts now, not at the first non-zero percentage — 7z spends its
+        # scan phase at 0%, and excluding it made every early ETA far too low.
+        self._start_time       = time.monotonic()
         lay = QVBoxLayout(self)
         lay.setSpacing(10)
         lay.setContentsMargins(14, 14, 14, 14)
@@ -418,21 +691,46 @@ class ProgressDialog(QDialog):
         self.log.setMinimumHeight(180)
         lay.addWidget(self.log)
 
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self.cancel_btn = QPushButton(QIcon.fromTheme("process-stop"), "Cancel")
+        self.cancel_btn.setEnabled(False)   # enabled by set_worker()
+        self.cancel_btn.clicked.connect(self.request_cancel)
+        btn_row.addWidget(self.cancel_btn)
         self.close_btn = QPushButton(QIcon.fromTheme("dialog-close"), "Close")
         self.close_btn.setEnabled(False)
         self.close_btn.clicked.connect(self.accept)
-        lay.addWidget(self.close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+        btn_row.addWidget(self.close_btn)
+        lay.addLayout(btn_row)
+
+    def set_worker(self, worker):
+        """Attach the worker this dialog is reporting on, so Cancel can stop it."""
+        self._worker = worker
+        self.cancel_btn.setEnabled(worker is not None)
+
+    def request_cancel(self):
+        """Signal the worker to stop.  The dialog stays up until the worker
+        reports back through finish() — killing 7z is not instantaneous."""
+        if self._operation_done or self._cancel_requested:
+            return
+        self._cancel_requested = True
+        self.cancel_btn.setEnabled(False)
+        self.status.setText("Cancelling…")
+        self.append("⏹ Cancelling — stopping 7-Zip…")
+        if self._worker is not None:
+            self._worker.cancel()
 
     def reject(self):
-        # Block Escape / window-X while the operation is still running.
-        # Once finish() has been called the close button handles dismissal.
+        # Escape / window-X mid-operation cancels rather than doing nothing.
         if self._operation_done:
             super().reject()
-        # else: silently ignore — worker is mid-flight, cannot be cancelled here.
+        else:
+            self.request_cancel()
 
     def closeEvent(self, event):
         if not self._operation_done:
-            event.ignore()   # prevent window manager X from closing mid-operation
+            event.ignore()   # cannot vanish while 7z is still winding down
+            self.request_cancel()
         else:
             super().closeEvent(event)
 
@@ -441,8 +739,6 @@ class ProgressDialog(QDialog):
         self._eta_lbl.setVisible(True)
         self._bar.setValue(pct)
         if pct > 0:
-            if self._start_time is None:
-                self._start_time = time.monotonic()
             elapsed = time.monotonic() - self._start_time
             remaining = elapsed * (100 - pct) / pct
             mins, secs = divmod(int(remaining), 60)
@@ -458,6 +754,7 @@ class ProgressDialog(QDialog):
 
     def finish(self, success, message):
         self._operation_done = True
+        self.cancel_btn.setEnabled(False)
         if self._bar.isVisible():
             self._bar.setValue(100)
             self._eta_lbl.setText("")
@@ -466,7 +763,8 @@ class ProgressDialog(QDialog):
         self.status.setText(
             f'<span style="color:{color}; font-weight:bold;">{icon} {message}</span>'
         )
-        if success:
+        if success or self._cancel_requested:
+            # A cancel is a deliberate act, not an error to be acknowledged.
             self.accept()
         else:
             self.close_btn.setEnabled(True)
@@ -879,7 +1177,11 @@ class CreateArchiveDialog(QDialog):
                 return
             if clicked == btn_overwrite:
                 try:
-                    os.remove(out)
+                    # A split archive has no file at the base name at all — its
+                    # parts are out.001, out.002…  Removing only "out" left the
+                    # old parts on disk to be mixed in with the new set.
+                    for _part in _archive_part_paths(out):
+                        os.remove(_part)
                 except Exception as e:
                     QMessageBox.critical(self, "Error", f"Could not remove existing archive:\n{e}")
                     return
@@ -953,9 +1255,11 @@ class ExtractDialog(QDialog):
         form.addRow("Extract to:", dest_row)
 
         self.subfolder = QCheckBox("Create subfolder using archive name")
-        # Smart default passed in; fall back to last-used setting if not overridden
-        subfolder_saved = _s.value("extract_subfolder", True, type=bool)
-        self.subfolder.setChecked(self._default_subfolder and subfolder_saved)
+        # The saved value is the user's standing preference; _default_subfolder
+        # is a per-archive heuristic that can only suppress it, never set it.
+        self._subfolder_pref = _s.value("extract_subfolder", True, type=bool)
+        self._subfolder_computed = self._default_subfolder and self._subfolder_pref
+        self.subfolder.setChecked(self._subfolder_computed)
         form.addRow("", self.subfolder)
 
         self.preserve = QCheckBox("Preserve full directory paths")
@@ -1018,7 +1322,10 @@ class ExtractDialog(QDialog):
     def get_params(self):
         # Persist extract settings for next session
         s = QSettings(ORG_NAME, APP_NAME)
-        s.setValue("extract_subfolder", self.subfolder.isChecked())
+        # Persist only a real user change.  Writing back the computed value meant
+        # one self-contained archive turned the preference off permanently.
+        if self.subfolder.isChecked() != self._subfolder_computed:
+            s.setValue("extract_subfolder", self.subfolder.isChecked())
         s.setValue("extract_preserve",  self.preserve.isChecked())
         s.setValue("extract_overwrite", self.overwrite.isChecked())
 
@@ -1054,9 +1361,13 @@ class InfoPanel(QFrame):
         sep.setFrameShape(QFrame.Shape.HLine)
         lay.addWidget(sep)
 
+        # "Volumes" must be in this tuple: update() can only write into a row
+        # that was built here, so a multi-volume archive's part count used to be
+        # computed and then silently dropped.
         self._labels = {}
-        for key in ("Format", "Files", "Folders", "Size", "Packed", "Ratio", "Path"):
-            row = QHBoxLayout()
+        self._keys   = {}
+        for key in ("Format", "Files", "Folders", "Size", "Packed",
+                    "Volumes", "Ratio", "Path"):
             lbl_key = QLabel(f"{key}:")
             lbl_key.setStyleSheet("color: palette(mid); font-size: 8pt;")
             lbl_val = QLabel("—")
@@ -1065,18 +1376,31 @@ class InfoPanel(QFrame):
             lay.addWidget(lbl_key)
             lay.addWidget(lbl_val)
             self._labels[key] = lbl_val
+            self._keys[key]   = lbl_key
+
+        # Rows that only apply to some archives, hidden unless update() sets them
+        self._optional = ("Volumes",)
+        self._show_optional(False)
 
         lay.addStretch()
         self.setVisible(False)   # hidden until an archive is loaded
+
+    def _show_optional(self, visible, keys=None):
+        for k in (keys if keys is not None else self._optional):
+            self._keys[k].setVisible(visible)
+            self._labels[k].setVisible(visible)
 
     def update(self, data: dict):
         for k, v in data.items():
             if k in self._labels:
                 self._labels[k].setText(str(v))
+        for k in self._optional:
+            self._show_optional(k in data, keys=(k,))
 
     def clear(self):
         for lbl in self._labels.values():
             lbl.setText("—")
+        self._show_optional(False)
         self.setVisible(False)
 
 
@@ -1190,11 +1514,14 @@ class FilesystemBrowser(QWidget):
         # Sync dir tree without triggering _on_dir_changed loop
         idx = self._dir_model.index(path)
         if idx.isValid():
-            self._dir_tree.blockSignals(True)
+            # _on_dir_changed is connected to the *selection model*, so blocking
+            # the view's own signals never suppressed the re-entrant call.
+            sel = self._dir_tree.selectionModel()
+            sel.blockSignals(True)
             self._dir_tree.setCurrentIndex(idx)
             self._dir_tree.scrollTo(idx)
             self._dir_tree.expand(idx)
-            self._dir_tree.blockSignals(False)
+            sel.blockSignals(False)
         self.navigated.emit()
 
     def _on_dir_changed(self, current, _prev):
@@ -1443,14 +1770,17 @@ class ArchiveModel(QAbstractItemModel):
         self.layoutAboutToBeChanged.emit()
         reverse = (order == Qt.SortOrder.DescendingOrder)
 
-        def key(r):
-            type_rank = 0 if r.is_dir else 1        # dirs always before files
+        def value_key(r):
             if column in (1, 2):                     # Size / Packed — numeric
-                return (type_rank, r.raw_size)
+                return r.raw_size
             attr = self._COL_ATTRS[column] if column < 6 else "name"
-            return (type_rank, (getattr(r, attr, "") or "").lower())
+            return (getattr(r, attr, "") or "").lower()
 
-        self._rows.sort(key=key, reverse=reverse)
+        # Two stable passes.  Reversing a single (type_rank, value) tuple also
+        # reversed type_rank, which pushed folders *below* files in descending
+        # order — the opposite of "dirs always before files".
+        self._rows.sort(key=value_key, reverse=reverse)
+        self._rows.sort(key=lambda r: 0 if r.is_dir else 1)
         self.layoutChanged.emit()
 
 
@@ -1463,6 +1793,7 @@ class ArchiveView(QTreeView):
         self._arc_model = model
         self.setModel(model)
         self.archive_path = None          # kept in sync by MainWindow
+        self.password     = ""            # likewise; drag-out runs its own 7z
         self.setDragEnabled(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
         self.setDefaultDropAction(Qt.DropAction.CopyAction)
@@ -1490,20 +1821,38 @@ class ArchiveView(QTreeView):
             super().startDrag(supportedActions)
             return
 
-        # Extract synchronously to a temp dir — acceptable latency for small batches
+        # Extract synchronously to a temp dir — acceptable latency for small batches.
+        # 'x', not 'e': a flat extract collapses a/notes.txt and b/notes.txt onto
+        # the same name and the drag silently hands over only one of them.
         tmp_dir = tempfile.mkdtemp(prefix="squatchzip_drag_")
-        cmd = ["7z", "e", self.archive_path, f"-o{tmp_dir}", "-y"] + file_paths
-        result = subprocess.run(cmd, capture_output=True)
+        cmd = ["7z", "x", self.archive_path, f"-o{tmp_dir}", "-y"]
+        if self.password:
+            cmd += [f"-p{self.password}"]
+        cmd += file_paths
+        # stdin=DEVNULL: this runs on the GUI thread, so a password prompt here
+        # would freeze the whole window with no dialog to cancel.
+        result = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL)
         if result.returncode != 0:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
             return
 
         urls = []
         for p in file_paths:
-            local = Path(tmp_dir) / Path(p).name
+            local = Path(tmp_dir) / p          # 'x' preserved the internal path
             if local.exists():
                 urls.append(QUrl.fromLocalFile(str(local)))
 
         if not urls:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return
+
+        # The drop target reads these files after exec() returns, so the dir has
+        # to outlive the drag.  MainWindow removes it when the window closes.
+        win = self.window()
+        if hasattr(win, "_temp_dirs"):
+            win._temp_dirs.add(tmp_dir)
+        else:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
             return
 
         mime = QMimeData()
@@ -1524,6 +1873,7 @@ class ArchiveTab(QWidget):
         super().__init__(parent)
         self.archive_path = None
         self.mv_info      = None
+        self.preview_dir  = None   # reused scratch dir for the preview pane
         self.all_entries  = []
         self.current_path = ""
         self.nav_history  = []
@@ -1630,9 +1980,13 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(860, 540)
-        self._worker            = None
         self._settings          = QSettings(ORG_NAME, APP_NAME)
         self._session_passwords = {}   # archive_path → password, cleared on app exit
+        # Running QThreads.  A single self._worker attribute was not enough:
+        # starting a second operation rebound it and the first thread could be
+        # garbage-collected while still running, aborting the process.
+        self._workers = set()
+        self._temp_dirs = set()        # drag/open scratch dirs, removed on exit
 
         geom = self._settings.value("geometry")
         if geom:
@@ -1649,6 +2003,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, ev):
         self._settings.setValue("geometry", self.saveGeometry())
+        # Drag-out and open-with scratch dirs have to outlive the operation that
+        # made them (the drop target / launched app still reads from them), so
+        # this is the first safe point to remove them.
+        for d in self._temp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+        self._temp_dirs.clear()
         super().closeEvent(ev)
 
     def current_tab(self):
@@ -1666,11 +2026,15 @@ class MainWindow(QMainWindow):
         return tab
 
     def _close_tab(self, index):
-        if index == 0:   # browser tab — permanent
+        if index == 0:   # browser tab — permanent (its close button is removed
+                         # in __init__, so this is only a belt-and-braces guard)
             return
         tab = self._tab_widget.widget(index)
         if isinstance(tab, ArchiveTab):
             tab.preview_timer.stop()
+            if tab.preview_dir:
+                shutil.rmtree(tab.preview_dir, ignore_errors=True)
+                tab.preview_dir = None
         self._tab_widget.removeTab(index)
         if self._tab_widget.count() == 1:   # only browser tab remains
             self._tab_widget.setCurrentIndex(0)
@@ -1719,6 +2083,10 @@ class MainWindow(QMainWindow):
         self._fs_browser.open_archive_requested.connect(self._open_path)
         self._fs_browser.archive_requested.connect(self._handle_fs_archive_request)
         self._tab_widget.addTab(self._fs_browser, QIcon.fromTheme("folder"), "Browse")
+        # _close_tab refuses to close tab 0, so leaving a close button on it just
+        # gave the user a control that does nothing.
+        for _side in (QTabBar.ButtonPosition.RightSide, QTabBar.ButtonPosition.LeftSide):
+            self._tab_widget.tabBar().setTabButton(0, _side, None)
 
         root.addWidget(self._tab_widget, 1)
 
@@ -1887,6 +2255,7 @@ class MainWindow(QMainWindow):
                 path = first
         tab.archive_path = path
         tab.tree.archive_path = path
+        tab.tree.password     = self._archive_password(path)
         tab.all_entries  = []
         tab.nav_history  = []
         tab.current_path = ""
@@ -1989,7 +2358,8 @@ class MainWindow(QMainWindow):
                     break
 
     def _add_files_to_archive(self):
-        if not self.current_tab().archive_path:
+        tab = self.current_tab()
+        if not tab or not tab.archive_path:
             return
         files, _ = QFileDialog.getOpenFileNames(
             self, "Add Files to Archive", str(Path.home())
@@ -1999,7 +2369,8 @@ class MainWindow(QMainWindow):
         self._add_sources_to_archive(files)
 
     def _add_folder_to_archive(self):
-        if not self.current_tab().archive_path:
+        tab = self.current_tab()
+        if not tab or not tab.archive_path:
             return
         folder = QFileDialog.getExistingDirectory(
             self, "Add Folder to Archive", str(Path.home())
@@ -2009,14 +2380,30 @@ class MainWindow(QMainWindow):
         self._add_sources_to_archive([folder])
 
     def _add_sources_to_archive(self, sources):
+        tab = self.current_tab()
+        if not tab or not tab.archive_path:
+            return
         s = QSettings(ORG_NAME, APP_NAME)
         self._run_worker("create", "Adding to Archive…",
-                         archive=self.current_tab().archive_path,
+                         archive=tab.archive_path,
                          sources=sources,
                          level=int(s.value("compress_level", 5)),
                          solid=s.value("compress_solid", True, type=bool),
+                         password=self._archive_password(tab.archive_path),
                          delete_src=False,
                          _on_success=self._list)
+
+    def _archive_root_name(self):
+        """The archive's single top-level entry name, or None if it has several."""
+        tab = self.current_tab()
+        if not tab or not tab.all_entries:
+            return None
+        roots = set()
+        for entry in tab.all_entries:
+            path = (entry.get("Path") or "").strip().replace("\\", "/").strip("/")
+            if path:
+                roots.add(path.split("/")[0])
+        return roots.pop() if len(roots) == 1 else None
 
     def _should_create_subfolder(self):
         """
@@ -2025,7 +2412,7 @@ class MainWindow(QMainWindow):
         Return True (create subfolder) in all other cases.
         """
         tab = self.current_tab()
-        if not tab.all_entries:
+        if not tab or not tab.all_entries:
             return True
         root_names = set()
         has_nested = False
@@ -2043,26 +2430,25 @@ class MainWindow(QMainWindow):
 
     def _extract(self):
         tab = self.current_tab()
-        if not tab.archive_path:
+        if not tab or not tab.archive_path:
             return
         dlg = ExtractDialog(self, archive_path=tab.archive_path,
                             default_subfolder=self._should_create_subfolder())
-        stored_pw = self._session_passwords.get(tab.archive_path, "")
+        stored_pw = self._archive_password(tab.archive_path)
         if stored_pw:
             dlg.password.setText(stored_pw)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             p = dlg.get_params()
             arc_path = tab.archive_path
             def _save_pw():
-                if p["password"]:
-                    self._session_passwords[arc_path] = p["password"]
+                self._remember_password(arc_path, p["password"])
             self._run_worker("extract", "Extracting…",
                              _on_success=_save_pw,
                              archive=arc_path, **p)
 
     def _extract_selected(self):
         tab = self.current_tab()
-        if not tab.archive_path:
+        if not tab or not tab.archive_path:
             return
         selected_rows = self._selected_arc_rows()
         if not selected_rows:
@@ -2072,37 +2458,45 @@ class MainWindow(QMainWindow):
         paths = [r.path.rstrip("/") for r in selected_rows]
         dlg = ExtractDialog(self, archive_path=tab.archive_path,
                             default_subfolder=self._should_create_subfolder())
-        stored_pw = self._session_passwords.get(tab.archive_path, "")
+        stored_pw = self._archive_password(tab.archive_path)
         if stored_pw:
             dlg.password.setText(stored_pw)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             p = dlg.get_params()
             arc_path = tab.archive_path
             def _save_pw():
-                if p["password"]:
-                    self._session_passwords[arc_path] = p["password"]
+                self._remember_password(arc_path, p["password"])
             self._run_worker("extract", "Extracting Selected…",
                              _on_success=_save_pw,
                              archive=arc_path, paths=paths, **p)
 
     def _extract_here(self):
         tab = self.current_tab()
-        if not tab.archive_path:
+        if not tab or not tab.archive_path:
             return
         arc  = Path(tab.archive_path)
         stem = ExtractDialog._arc_stem(tab.archive_path)
-        dest = str(arc.parent / stem)
-        if os.path.exists(dest):
+        # Match the Extract dialog: an archive that already holds a single root
+        # directory needs no wrapper, or "foo.7z" lands in ./foo/foo/.
+        if self._should_create_subfolder():
+            dest, clash = str(arc.parent / stem), stem
+        else:
+            # Extracting straight into the archive's own directory, so the thing
+            # that can be clobbered is the archive's root entry, not the stem.
+            dest  = str(arc.parent)
+            clash = self._archive_root_name() or stem
+        if os.path.exists(os.path.join(str(arc.parent), clash)) or (
+                dest != str(arc.parent) and os.path.exists(dest)):
             answer = QMessageBox.question(
                 self, "Folder Already Exists",
-                f"\"{stem}\" already exists here.\n\n"
+                f"\"{clash}\" already exists here.\n\n"
                 "Existing files may be overwritten. Continue?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-        stored_pw = self._session_passwords.get(tab.archive_path, "")
+        stored_pw = self._archive_password(tab.archive_path)
         self._run_worker("extract", "Extracting Here…",
                          archive=tab.archive_path, dest=dest,
                          mode="x", overwrite=True,
@@ -2110,23 +2504,23 @@ class MainWindow(QMainWindow):
 
     def _test(self):
         tab = self.current_tab()
-        if not tab.archive_path:
+        if not tab or not tab.archive_path:
             return
-        stored_pw = self._session_passwords.get(tab.archive_path, "")
+        stored_pw = self._archive_password(tab.archive_path)
         self._run_worker("test", "Testing Archive…",
                          archive=tab.archive_path,
                          password=stored_pw)
 
     def _list(self):
         tab = self.current_tab()
-        if not tab.archive_path:
+        if not tab or not tab.archive_path:
             return
         self._sb_left.setText("Loading…")
         tab.arc_model.reset_data([])
         arc_path  = tab.archive_path
-        stored_pw = self._session_passwords.get(arc_path, "")
+        stored_pw = self._archive_password(arc_path)
         w = ArchiveWorker("list", archive=arc_path, password=stored_pw)
-        self._worker = w
+        self._track_worker(w)
         w.listing.connect(self._store_entries)
 
         def on_list_done(ok, msg):
@@ -2137,21 +2531,47 @@ class MainWindow(QMainWindow):
                     QLineEdit.EchoMode.Password,
                 )
                 if accepted and pw:
-                    self._session_passwords[arc_path] = pw
+                    self._remember_password(arc_path, pw)
                     self._list()
                 return
             if not ok:
                 QMessageBox.critical(self, "Error", msg)
 
-        w.finished.connect(on_list_done)
+        w.op_finished.connect(on_list_done)
         w.start()
 
+    # ── Session passwords ─────────────────────────────
+
+    def _archive_password(self, arc_path):
+        """Password learned for this archive during this session, or ""."""
+        return self._session_passwords.get(arc_path, "") if arc_path else ""
+
+    def _remember_password(self, arc_path, pw):
+        """Cache a working password for the session and push it onto the tab's
+        view, which runs its own 7z calls for drag-out and preview."""
+        if not arc_path or not pw:
+            return
+        self._session_passwords[arc_path] = pw
+        for i in range(self._tab_widget.count()):
+            t = self._tab_widget.widget(i)
+            if isinstance(t, ArchiveTab) and t.archive_path == arc_path:
+                t.tree.password = pw
+
     # ── Worker runner ─────────────────────────────────
+
+    def _track_worker(self, worker):
+        """Hold a reference until Qt itself reports the thread has finished."""
+        self._workers.add(worker)
+        worker.finished.connect(self._untrack_worker)   # QThread.finished
+
+    def _untrack_worker(self):
+        self._workers.discard(self.sender())
 
     def _run_worker(self, operation, title, _on_success=None, **kwargs):
         prog = ProgressDialog(self, title)
         w = ArchiveWorker(operation, **kwargs)
-        self._worker = w
+        self._track_worker(w)
+        prog.set_worker(w)
         w.progress.connect(prog.append)
         w.progress_pct.connect(prog.set_progress)
         result = [None]   # filled by on_done; None means worker never reported back
@@ -2163,7 +2583,7 @@ class MainWindow(QMainWindow):
             if success and _on_success:
                 _on_success()
 
-        w.finished.connect(on_done)
+        w.op_finished.connect(on_done)
         w.start()
         prog.exec()
         return result[0]   # True = success, False = failure
@@ -2173,6 +2593,8 @@ class MainWindow(QMainWindow):
     def _store_entries(self, files):
         """Receive flat listing from worker, display root level, update info panel."""
         tab = self.current_tab()
+        if not tab:
+            return
         tab.all_entries = files
         tab.nav_history.clear()
         self._show_level("", push_history=False)
@@ -2180,7 +2602,7 @@ class MainWindow(QMainWindow):
         # Archive-wide stats for info panel
         total_size = total_packed = file_count = folder_count = 0
         for e in files:
-            is_dir = "D" in e.get("Attributes", "") or e.get("Path", "").endswith("/")
+            is_dir = _entry_is_dir(e)
             if not is_dir:
                 total_size   += self._safe_int(e.get("Size", "0"))
                 total_packed += self._safe_int(e.get("Packed Size", "0"))
@@ -2229,7 +2651,7 @@ class MainWindow(QMainWindow):
             raw = entry.get("Path", "").strip().replace("\\", "/").lstrip("/")
             if not raw:
                 continue
-            is_dir_entry = "D" in entry.get("Attributes", "") or raw.endswith("/")
+            is_dir_entry = _entry_is_dir(entry) or raw.endswith("/")
             raw = raw.rstrip("/")
 
             # Filter to entries under current path
@@ -2323,12 +2745,12 @@ class MainWindow(QMainWindow):
             total_size = sum(
                 self._safe_int(e.get("Size", "0"))
                 for e in tab.all_entries
-                if "D" not in e.get("Attributes", "") and not e.get("Path", "").endswith("/")
+                if not _entry_is_dir(e)
             )
             total_packed = sum(
                 self._safe_int(e.get("Packed Size", "0"))
                 for e in tab.all_entries
-                if "D" not in e.get("Attributes", "") and not e.get("Path", "").endswith("/")
+                if not _entry_is_dir(e)
             )
             self._sb_right.setText(
                 f"Total: {self._fmt_size(total_size)}  "
@@ -2337,7 +2759,10 @@ class MainWindow(QMainWindow):
 
     def _on_item_activated(self, index):
         """Double-click or Enter: enter a directory, or extract-and-open a file."""
-        row = self.current_tab().arc_model.row_data(index.row())
+        tab = self.current_tab()
+        if not tab:
+            return
+        row = tab.arc_model.row_data(index.row())
         if not row:
             return
         if row.is_dir:
@@ -2347,16 +2772,23 @@ class MainWindow(QMainWindow):
 
     def _open_item_in_app(self, internal_path):
         """Extract a single archive entry to a temp dir and open it with xdg-open."""
+        tab = self.current_tab()
+        if not tab or not tab.archive_path:
+            return
+        # The launched app needs the file to outlive this call, so the directory
+        # cannot be removed here — it is cleaned up when the window closes.
         tmp_dir = tempfile.mkdtemp(prefix="squatchzip_")
+        self._temp_dirs.add(tmp_dir)
         file_name = Path(internal_path).name
         tmp_file  = str(Path(tmp_dir) / file_name)
         self._run_worker(
             "extract", f"Opening {file_name}…",
-            archive=self.current_tab().archive_path,
+            archive=tab.archive_path,
             dest=tmp_dir,
             mode="e",        # flat extract — no path structure in temp dir
             overwrite=True,
             paths=[internal_path.rstrip("/")],
+            password=self._archive_password(tab.archive_path),
             _on_success=lambda: subprocess.Popen(["xdg-open", tmp_file])
         )
 
@@ -2365,12 +2797,16 @@ class MainWindow(QMainWindow):
     def _current_arc_row(self):
         """Return the ArchiveRow for the currently focused item, or None."""
         tab = self.current_tab()
+        if not tab:
+            return None
         idx = tab.tree.currentIndex()
         return tab.arc_model.row_data(idx.row()) if idx.isValid() else None
 
     def _selected_arc_rows(self):
         """Return ArchiveRow objects for all selected rows (de-duplicated)."""
         tab = self.current_tab()
+        if not tab:
+            return []
         seen, rows = set(), []
         for idx in tab.tree.selectedIndexes():
             r = idx.row()
@@ -2403,6 +2839,8 @@ class MainWindow(QMainWindow):
     def _update_preview(self):
         """Extract and display a preview for the currently selected archive file."""
         tab = self.current_tab()
+        if not tab:
+            return
         arc_row = self._current_arc_row()
         if not arc_row or arc_row.is_dir:
             tab.preview_placeholder.setText("Select a file to preview")
@@ -2422,9 +2860,24 @@ class MainWindow(QMainWindow):
         if not tab.archive_path:
             return
 
-        tmp_dir = tempfile.mkdtemp(prefix="squatchzip_prev_")
+        # One scratch dir per tab, emptied between previews.  This used to
+        # mkdtemp on every selection change and never clean up, so arrowing
+        # through an archive left hundreds of directories behind in /tmp.
+        if not tab.preview_dir or not os.path.isdir(tab.preview_dir):
+            tab.preview_dir = tempfile.mkdtemp(prefix="squatchzip_prev_")
+        tmp_dir = tab.preview_dir
+        for stale in Path(tmp_dir).iterdir():
+            if stale.is_dir():
+                shutil.rmtree(stale, ignore_errors=True)
+            else:
+                stale.unlink(missing_ok=True)
+
         cmd = ["7z", "e", tab.archive_path, f"-o{tmp_dir}", "-y", internal_path]
-        result = subprocess.run(cmd, capture_output=True)
+        pw = self._archive_password(tab.archive_path)
+        if pw:
+            cmd += [f"-p{pw}"]
+        # stdin=DEVNULL — this runs on the GUI thread; see startDrag.
+        result = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL)
         if result.returncode != 0:
             tab.preview_placeholder.setText("Could not extract file for preview.")
             tab.preview_stack.setCurrentIndex(0)
@@ -2484,6 +2937,8 @@ class MainWindow(QMainWindow):
 
     def _update_location_bar(self):
         tab = self.current_tab()
+        if not tab:
+            return
         if not tab.archive_path:
             tab.loc_bar.setVisible(False)
             return
@@ -2546,7 +3001,8 @@ class MainWindow(QMainWindow):
     # ── Context menu ──────────────────────────────────
 
     def _ctx_menu(self, _pos):
-        if not self.current_tab().archive_path:
+        tab = self.current_tab()
+        if not tab or not tab.archive_path:
             return
         menu = QMenu(self)
         menu.addAction(self._a_extract)
@@ -2594,13 +3050,14 @@ class MainWindow(QMainWindow):
         if not selected_rows:
             return
         src_paths = [r.path.rstrip("/") for r in selected_rows]
-        stored_pw = self._session_passwords.get(tab.archive_path, "")
+        stored_pw = self._archive_password(tab.archive_path)
         result = self._run_worker(
             "copy_to_archive", "Copying to Archive…",
             src_archive=tab.archive_path,
             src_paths=src_paths,
             dst_archive=dest_archive,
-            password=stored_pw,
+            password=stored_pw,                                    # source
+            dst_password=self._archive_password(dest_archive),     # destination
         )
         if result:
             self._tab_widget.setCurrentIndex(dest_tab_idx)
@@ -2635,8 +3092,12 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+        tab = self.current_tab()
+        if not tab or not tab.archive_path:
+            return
         self._run_worker("delete", "Deleting from Archive…",
-                         archive=self.current_tab().archive_path, paths=paths,
+                         archive=tab.archive_path, paths=paths,
+                         password=self._archive_password(tab.archive_path),
                          _on_success=self._list)
 
     def _rename_item(self):
@@ -2658,12 +3119,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid Name",
                                 "File name cannot contain \"/\".")
             return
-        parent = str(Path(old_path).parent).lstrip(".")
-        new_path = (f"{parent}/{new_name.strip()}" if parent and parent != "/"
+        # Path(".") is what parent gives for a root-level entry.  Stripping "."
+        # off the string instead also ate the leading dot of a real dot-directory,
+        # so renaming inside ".config" silently created a new "config" tree.
+        parent = Path(old_path).parent
+        parent_str = "" if parent in (Path("."), Path("/")) else str(parent)
+        new_path = (f"{parent_str}/{new_name.strip()}" if parent_str
                     else new_name.strip())
+        tab = self.current_tab()
+        if not tab or not tab.archive_path:
+            return
         self._run_worker("rename", "Renaming…",
-                         archive=self.current_tab().archive_path,
+                         archive=tab.archive_path,
                          old_name=old_path, new_name=new_path,
+                         password=self._archive_password(tab.archive_path),
                          _on_success=self._list)
 
     def _check_deps(self):
@@ -2820,7 +3289,8 @@ def main():
                 win._open_path(archive)
                 win._run_worker("extract", "Extracting…",
                                 archive=archive, dest=dest,
-                                mode="x", overwrite=True)
+                                mode="x", overwrite=True,
+                                password=win._archive_password(archive))
 
     else:
         # Default: open the first positional file argument if it looks like an archive

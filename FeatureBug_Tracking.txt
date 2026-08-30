@@ -4,8 +4,12 @@ XXX  - Estimated time on extraction — 7z outputs progress percentages, we alre
 nope  - Split-archive from context menu — wire the existing create dialog params to a right-click, maybe 30 minutes
 
   Medium (1-2 sessions, similar to drag-out):
-XXX  - Remember passwords — QSettings store per-archive-path, add a "save password" checkbox to the extract dialog; straightforward but
-  needs care around security
+XXX  - Remember passwords — SESSION-ONLY BY DESIGN. Held in a dict for the life of the
+  process and never written to disk; there is no "save password" checkbox and no
+  QSettings key. Decided against persisting: QSettings would put archive passwords in
+  cleartext in ~/.config, and a KWallet/libsecret backend adds a dependency for little
+  gain. (2.3.0 plumbed the session password through to add/delete/rename/copy/preview/
+  drag-out, which had been silently dropping it.)
 XXX  - Copy between tabs — extract selected to temp, add to other tab's archive; the tab architecture makes this possible now, maybe a
   session
 
@@ -16,4 +20,11 @@ XXX  - Progress with ETA — 7z's percentage output is inconsistent across opera
   Not worth it:
   - RAR/ISO write — licensing wall, not a code problem
 
-
+  Known limitations (not bugs, no fix planned):
+  - Passwords are passed to 7z as -p<pw> on the command line, so they are visible in
+    /proc/<pid>/cmdline to other local users. 7-Zip offers no password-file or
+    stdin-password option; there is no fix short of a wrapper.
+  - Browsing a .tar.gz/.tar.bz2/.tar.xz shows the inner .tar as a single entry, because
+    that is what 7z lists. Creating and extracting them work correctly (2.3.0); making
+    the tree descend into the inner tar would need transparent repacking for
+    delete/rename and is a much larger change.

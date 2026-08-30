@@ -10,7 +10,7 @@ A clean, fast 7-Zip GUI that looks and feels like Ark — with the features PeaZ
 
 | Feature | SquatchZip |
 |---|---|
-| 7-Zip backend (7z, zip, tar, gz, bz2, xz) | ✓ |
+| 7-Zip backend (7z, zip, tar, tar.gz, tar.bz2, tar.xz, gz, bz2) | ✓ |
 | Full directory tree view with icons | ✓ |
 | File size / packed size / ratio columns | ✓ |
 | Drag & drop archives to open | ✓ |
@@ -22,6 +22,7 @@ A clean, fast 7-Zip GUI that looks and feels like Ark — with the features PeaZ
 | **Delete source files after archiving** | ✓ ← the whole point |
 | Confirmation dialog before deletion | ✓ |
 | Test archive integrity | ✓ |
+| Cancel a running operation | ✓ |
 | Extract with full paths or flat | ✓ |
 | Extract here / extract to folder | ✓ |
 | Right-click service menu in Dolphin | ✓ |
@@ -72,6 +73,25 @@ squatchzip archive.7z
 ### "Delete After Archiving"
 
 When creating an archive, the highlighted option **"Delete source files after successful archiving"** will permanently remove source files/folders using `shutil.rmtree` (folders) or `os.remove` (files) — but **only** after `7z` exits with code 0. A confirmation dialog appears before any deletion. Any deletion errors are logged but don't affect the archive.
+
+**Sources are never deleted when the archive is incomplete.** If "Exclude hidden files"
+was checked (`-xr!.*`), or if the NTFS junction-point retry had to re-run with symbolic
+links excluded (`-xr!@`), the archive holds less than the source tree — so deletion is
+skipped entirely and the log says which exclusion caused it. The archive still gets
+created; only the deletion is suppressed.
+
+---
+
+## Notes on formats
+
+`.tar.gz`, `.tar.bz2` and `.tar.xz` are built in two passes — the sources are tarred
+first, then compressed — because gzip/bzip2/xz each wrap a single stream and 7-Zip
+cannot produce them in one step. Extraction reverses this automatically, so you get
+your files rather than an intermediate `.tar`. Browsing one of these archives still
+shows the inner `.tar` as a single entry, which is what 7-Zip reports.
+
+These three formats cannot be encrypted; a password entered for them is ignored, with a
+warning in the log. Use `.7z` or `.zip` for an encrypted archive.
 
 ---
 

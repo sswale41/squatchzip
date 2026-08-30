@@ -4,7 +4,7 @@
 #
 #  Usage:
 #    ./install.sh            — install for current user (~/.local)
-#    ./install.sh --system   — install system-wide (/usr/local, /usr/share)
+#    ./install.sh --system   — install system-wide (/usr/bin, /usr/share)
 #                              requires root / sudo
 # ──────────────────────────────────────────────────────────────
 set -euo pipefail
