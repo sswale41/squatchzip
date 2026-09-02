@@ -36,7 +36,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QAction, QIcon, QFont, QDragEnterEvent, QDropEvent, QCursor, QFileSystemModel, QPixmap
 
 # ─────────────────────────────────────────────────────
-VERSION  = "2.3.0"
+VERSION  = "2.3.1"
 APP_NAME = "SquatchZip"
 ORG_NAME = "SquatchLabs"
 
@@ -82,6 +82,79 @@ ICON_EXT_MAP = {
     "xml":  "text-xml",             "conf": "text-x-generic",
     "cfg":  "text-x-generic",
 }
+
+
+# ═════════════════════════════════════════════════════
+#  Message Boxes
+# ═════════════════════════════════════════════════════
+
+# Qt's static QMessageBox helpers (about/information/warning/critical/question)
+# hand the dialog to the platform theme, and on Plasma 6 that path is unsafe:
+# QDialogPrivate::setNativeDialogVisible() never clears its nativeDialogInUse
+# flag when hiding, so closing the box with the window-manager X calls
+# helper->hide() once on the way out and a second time from ~QDialog, against
+# platform resources that were already freed.  The second call dereferences a
+# stale vtable and the process dies with SIGSEGV *after* exec() has returned —
+# the crash lands in the destructor, so the calling code looks innocent.
+#
+# Drawing the box with Qt's own widget skips the platform helper entirely.
+# Native *file* dialogs are a separate helper and stay enabled, so the KDE file
+# picker (places sidebar, KIO remote URLs) is unaffected.
+#
+# Reported against Qt 6.11; re-check when Tumbleweed ships a fix.
+
+def _message_box(parent, icon, title, text,
+                 buttons=QMessageBox.StandardButton.Ok,
+                 default=QMessageBox.StandardButton.NoButton):
+    """Show a non-native modal message box and return the button pressed.
+
+    Returns NoButton when the dialog is dismissed without a click (Escape or
+    the window-manager X), which every caller treats as "do not proceed".
+    """
+    box = QMessageBox(parent)
+    box.setOption(QMessageBox.Option.DontUseNativeDialog, True)
+    box.setIcon(icon)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setStandardButtons(buttons)
+    if default != QMessageBox.StandardButton.NoButton:
+        box.setDefaultButton(default)
+    box.exec()
+    return box.standardButton(box.clickedButton())
+
+
+def _msg_information(parent, title, text,
+                     buttons=QMessageBox.StandardButton.Ok,
+                     default=QMessageBox.StandardButton.NoButton):
+    return _message_box(parent, QMessageBox.Icon.Information,
+                        title, text, buttons, default)
+
+
+def _msg_warning(parent, title, text,
+                 buttons=QMessageBox.StandardButton.Ok,
+                 default=QMessageBox.StandardButton.NoButton):
+    return _message_box(parent, QMessageBox.Icon.Warning,
+                        title, text, buttons, default)
+
+
+def _msg_critical(parent, title, text,
+                  buttons=QMessageBox.StandardButton.Ok,
+                  default=QMessageBox.StandardButton.NoButton):
+    return _message_box(parent, QMessageBox.Icon.Critical,
+                        title, text, buttons, default)
+
+
+def _msg_question(parent, title, text,
+                  buttons=(QMessageBox.StandardButton.Yes
+                           | QMessageBox.StandardButton.No),
+                  default=QMessageBox.StandardButton.NoButton):
+    return _message_box(parent, QMessageBox.Icon.Question,
+                        title, text, buttons, default)
+
+
+def _msg_about(parent, title, text):
+    """Stand-in for the QMessageBox about() static, which cannot opt out."""
+    return _message_box(parent, QMessageBox.Icon.Information, title, text)
 
 
 # ═════════════════════════════════════════════════════
@@ -1153,10 +1226,10 @@ class CreateArchiveDialog(QDialog):
 
     def _validate(self):
         if not self.indiv_each.isChecked() and not self.out_path.text().strip():
-            QMessageBox.warning(self, "Missing Output", "Please specify an output path.")
+            _msg_warning(self, "Missing Output", "Please specify an output path.")
             return
         if self.file_list.count() == 0:
-            QMessageBox.warning(self, "No Files", "Add at least one file or folder.")
+            _msg_warning(self, "No Files", "Add at least one file or folder.")
             return
 
         out = self.out_path.text().strip()
@@ -1164,6 +1237,7 @@ class CreateArchiveDialog(QDialog):
         # In individual mode the per-file archive paths aren't known yet.
         if not self.indiv_each.isChecked() and os.path.exists(out):
             mb = QMessageBox(self)
+            mb.setOption(QMessageBox.Option.DontUseNativeDialog, True)
             mb.setWindowTitle("Archive Already Exists")
             mb.setText(f"\u201c{Path(out).name}\u201d already exists.\n\nWhat would you like to do?")
             mb.setIcon(QMessageBox.Icon.Question)
@@ -1183,12 +1257,12 @@ class CreateArchiveDialog(QDialog):
                     for _part in _archive_part_paths(out):
                         os.remove(_part)
                 except Exception as e:
-                    QMessageBox.critical(self, "Error", f"Could not remove existing archive:\n{e}")
+                    _msg_critical(self, "Error", f"Could not remove existing archive:\n{e}")
                     return
             # btn_add: leave the file alone — 7z 'a' will append by default
 
         if self.delete_src.isChecked():
-            answer = QMessageBox.question(
+            answer = _msg_question(
                 self, "Confirm Deletion",
                 "Source files will be permanently deleted after archiving.\n"
                 "Are you sure you want to continue?",
@@ -2241,14 +2315,14 @@ class MainWindow(QMainWindow):
             first, total, missing_first = mv
             tab.mv_info = mv
             if missing_first:
-                QMessageBox.warning(
+                _msg_warning(
                     self, "Multi-Volume Archive",
                     f"This is part of a {total}-part archive but "
                     f"the first part was not found:\n{first}\n\n"
                     "Extraction may fail without all parts present."
                 )
             elif path != first:
-                QMessageBox.information(
+                _msg_information(
                     self, "Multi-Volume Archive",
                     f"Opening from the first part of this {total}-part archive."
                 )
@@ -2346,7 +2420,7 @@ class MainWindow(QMainWindow):
                 delete_src=p["delete_src"], excl_hidden=p["excl_hidden"],
             )
             if not ok and remaining > 0:
-                answer = QMessageBox.question(
+                answer = _msg_question(
                     self, "Archive Failed",
                     f"\u201c{src_path.name}\u201d could not be archived.\n\n"
                     f"{remaining} file(s) remaining.\n\n"
@@ -2452,7 +2526,7 @@ class MainWindow(QMainWindow):
             return
         selected_rows = self._selected_arc_rows()
         if not selected_rows:
-            QMessageBox.information(self, "No Selection",
+            _msg_information(self, "No Selection",
                                     "Select one or more files or folders first.")
             return
         paths = [r.path.rstrip("/") for r in selected_rows]
@@ -2487,7 +2561,7 @@ class MainWindow(QMainWindow):
             clash = self._archive_root_name() or stem
         if os.path.exists(os.path.join(str(arc.parent), clash)) or (
                 dest != str(arc.parent) and os.path.exists(dest)):
-            answer = QMessageBox.question(
+            answer = _msg_question(
                 self, "Folder Already Exists",
                 f"\"{clash}\" already exists here.\n\n"
                 "Existing files may be overwritten. Continue?",
@@ -2535,7 +2609,7 @@ class MainWindow(QMainWindow):
                     self._list()
                 return
             if not ok:
-                QMessageBox.critical(self, "Error", msg)
+                _msg_critical(self, "Error", msg)
 
         w.op_finished.connect(on_list_done)
         w.start()
@@ -3079,12 +3153,12 @@ class MainWindow(QMainWindow):
             return
         selected_rows = self._selected_arc_rows()
         if not selected_rows:
-            QMessageBox.information(self, "No Selection",
+            _msg_information(self, "No Selection",
                                     "Select one or more items to delete first.")
             return
         paths = [r.path.rstrip("/") for r in selected_rows]
         n = len(paths)
-        answer = QMessageBox.question(
+        answer = _msg_question(
             self, "Delete from Archive",
             f"Permanently delete {n} item(s) from the archive?\n\nThis cannot be undone.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -3105,7 +3179,7 @@ class MainWindow(QMainWindow):
             return
         selected_rows = self._selected_arc_rows()
         if not selected_rows or len(selected_rows) != 1:
-            QMessageBox.information(self, "Rename",
+            _msg_information(self, "Rename",
                                     "Select exactly one item to rename.")
             return
         old_path = selected_rows[0].path.rstrip("/")
@@ -3116,7 +3190,7 @@ class MainWindow(QMainWindow):
         if not ok or not new_name.strip() or new_name.strip() == old_name:
             return
         if "/" in new_name.strip():
-            QMessageBox.warning(self, "Invalid Name",
+            _msg_warning(self, "Invalid Name",
                                 "File name cannot contain \"/\".")
             return
         # Path(".") is what parent gives for a root-level entry.  Stripping "."
@@ -3141,7 +3215,7 @@ class MainWindow(QMainWindow):
             found = shutil.which(tool)
             lines.append(f"{'✓' if found else '✗'}  {tool:<8}  "
                          f"{found or 'NOT FOUND — install p7zip / p7zip-full'}")
-        QMessageBox.information(self, "Dependency Check", "\n".join(lines))
+        _msg_information(self, "Dependency Check", "\n".join(lines))
 
     def _sevenz_info(self):
         dlg = QDialog(self)
@@ -3160,7 +3234,7 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _about(self):
-        QMessageBox.about(
+        _msg_about(
             self, f"About {APP_NAME}",
             f"<h2>{APP_NAME} {VERSION}</h2>"
             f"<p>A modern archive manager for <b>openSUSE Tumbleweed</b> / KDE Plasma 6.</p>"
@@ -3240,7 +3314,7 @@ def main():
 
     if not shutil.which("7z"):
         app = QApplication(sys.argv)
-        QMessageBox.critical(
+        _msg_critical(
             None, f"{APP_NAME} — Missing Dependency",
             "7z was not found on your system.\n\n"
             "Please install p7zip:\n\n"
