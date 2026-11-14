@@ -36,7 +36,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QAction, QIcon, QFont, QDragEnterEvent, QDropEvent, QCursor, QFileSystemModel, QPixmap
 
 # ─────────────────────────────────────────────────────
-VERSION  = "2.3.1"
+VERSION  = "2.3.2"
 APP_NAME = "SquatchZip"
 ORG_NAME = "SquatchLabs"
 
@@ -223,6 +223,32 @@ def _archive_part_paths(path):
     stem = path[:-4] if path.lower().endswith(".rar") else path
     paths += sorted(glob.glob(f"{stem}.part*.rar"))
     return paths
+
+
+def _find_hidden(sources, limit=3):
+    """Up to `limit` paths among `sources` that 7z's "-xr!.*" would skip.
+
+    The exclusion matches any name starting with "." at every depth, including
+    a selected top-level item.  An empty list means "Exclude hidden files"
+    leaves nothing behind, so deleting the sources afterwards is safe.
+    Symlinked directories are not followed — 7z stores the link itself.
+    """
+    found = []
+    for src in sources:
+        if os.path.basename(os.path.normpath(src)).startswith("."):
+            found.append(src)
+        elif os.path.isdir(src) and not os.path.islink(src):
+            for dirpath, dirnames, filenames in os.walk(src):
+                for name in dirnames + filenames:
+                    if name.startswith("."):
+                        found.append(os.path.join(dirpath, name))
+                        if len(found) >= limit:
+                            return found
+                # No need to descend into hidden dirs: already counted.
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        if len(found) >= limit:
+            return found[:limit]
+    return found
 
 
 class ArchiveWorker(QThread):
@@ -508,9 +534,17 @@ class ArchiveWorker(QThread):
         # The archive may hold less than the source tree: -xr!.* dropped every
         # dot-file, and the ELOOP retry dropped every symlink.  Deleting the
         # sources in that case destroys data that was never archived.
+        # "Exclude hidden" is a persisted setting, so only block the delete when
+        # hidden items actually exist — otherwise it silently disabled deletion
+        # for every create once the box had been ticked.
         _excluded = []
-        if excl_hidden:
+        _hidden = (_find_hidden(sources_abs)
+                   if excl_hidden and delete_src else [])
+        if _hidden:
             _excluded.append("hidden files")
+            self.progress.emit(
+                "⚠ Hidden items not archived, e.g.: " + ", ".join(_hidden)
+            )
         if symlinks_excluded:
             _excluded.append("symbolic links")
         if delete_src and _excluded:
@@ -1262,10 +1296,20 @@ class CreateArchiveDialog(QDialog):
             # btn_add: leave the file alone — 7z 'a' will append by default
 
         if self.delete_src.isChecked():
+            text = ("Source files will be permanently deleted after archiving.\n"
+                    "Are you sure you want to continue?")
+            if self.excl_hidden.isChecked():
+                srcs = [self.file_list.item(i).text()
+                        for i in range(self.file_list.count())]
+                if _find_hidden(srcs, limit=1):
+                    text = ("Hidden files were found and “Exclude hidden "
+                            "files” is on, so the hidden files will not be "
+                            "archived and the source files will be KEPT.\n\n"
+                            "Uncheck “Exclude hidden files” to archive "
+                            "and delete everything.\n\n"
+                            "Continue anyway?")
             answer = _msg_question(
-                self, "Confirm Deletion",
-                "Source files will be permanently deleted after archiving.\n"
-                "Are you sure you want to continue?",
+                self, "Confirm Deletion", text,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
             )

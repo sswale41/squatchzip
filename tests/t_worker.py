@@ -67,6 +67,42 @@ r = run("create", archive=f"{BASE}/nodel.7z", sources=[f"{BASE}/g2"], level=1,
 check("sources deleted when nothing excluded", not os.path.exists(f"{BASE}/g2"),
       str(r.get("msg")))
 
+print("\n=== 2.3.2: 'exclude hidden' with nothing hidden still deletes ===")
+shutil.rmtree(f"{BASE}/g3", ignore_errors=True); os.makedirs(f"{BASE}/g3/sub")
+open(f"{BASE}/g3/keep.txt","w").write("x\n"); open(f"{BASE}/g3/sub/x.txt","w").write("z\n")
+r = run("create", archive=f"{BASE}/g3.7z", sources=[f"{BASE}/g3"], level=1,
+        solid=True, delete_src=True, excl_hidden=True)
+check("archive created", r.get("ok") is True and os.path.exists(f"{BASE}/g3.7z"),
+      str(r.get("msg")))
+check("sources deleted (no hidden files present)", not os.path.exists(f"{BASE}/g3"),
+      str(r.get("msg")))
+
+print("\n=== 2.3.2: hidden top-level source is kept ===")
+shutil.rmtree(f"{BASE}/.cfg", ignore_errors=True); os.makedirs(f"{BASE}/.cfg")
+open(f"{BASE}/.cfg/a.txt","w").write("x\n")
+r = run("create", archive=f"{BASE}/cfg.7z", sources=[f"{BASE}/.cfg"], level=1,
+        solid=True, delete_src=True, excl_hidden=True)
+check("hidden top-level source kept", os.path.exists(f"{BASE}/.cfg/a.txt"),
+      str(r.get("msg")))
+check("log names the hidden item", any(".cfg" in l and "Hidden items" in l
+                                        for l in r["log"]), str(r["log"][-3:]))
+
+print("\n=== 2.3.2: _find_hidden ===")
+H = f"{BASE}/fh"; shutil.rmtree(H, ignore_errors=True)
+os.makedirs(f"{H}/clean/sub"); open(f"{H}/clean/sub/f","w").write("x")
+os.makedirs(f"{H}/nested/a/b"); open(f"{H}/nested/a/b/.dot","w").write("x")
+os.makedirs(f"{H}/.topdir")
+os.makedirs(f"{H}/many")
+for i in range(5): open(f"{H}/many/.h{i}","w").write("x")
+check("clean tree -> []", sz._find_hidden([f"{H}/clean"]) == [])
+check("nested dot-file found",
+      sz._find_hidden([f"{H}/nested"]) == [f"{H}/nested/a/b/.dot"],
+      str(sz._find_hidden([f"{H}/nested"])))
+check("top-level dot-dir found", sz._find_hidden([f"{H}/.topdir"]) == [f"{H}/.topdir"])
+check("limit caps results", len(sz._find_hidden([f"{H}/many"], limit=3)) == 3)
+check("limit across sources",
+      len(sz._find_hidden([f"{H}/.topdir", f"{H}/many"], limit=2)) == 2)
+
 print("\n=== Phase 1: stdin=DEVNULL — encrypted ops do not hang ===")
 enc = f"{BASE}/enc.7z"
 r = run("create", archive=enc, sources=[f"{BASE}/src"], level=1, solid=True,
