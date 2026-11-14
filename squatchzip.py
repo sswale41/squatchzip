@@ -36,7 +36,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QAction, QIcon, QFont, QDragEnterEvent, QDropEvent, QCursor, QFileSystemModel, QPixmap
 
 # ─────────────────────────────────────────────────────
-VERSION  = "2.3.3"
+VERSION  = "2.3.4"
 APP_NAME = "SquatchZip"
 ORG_NAME = "SquatchLabs"
 
@@ -157,6 +157,44 @@ def _msg_about(parent, title, text):
     return _message_box(parent, QMessageBox.Icon.Information, title, text)
 
 
+def _ask_existing_archives(parent, paths):
+    """One prompt for every individual-mode archive that already exists.
+
+    Returns "keep" (new archives get -2, -3…), "add" (append, 7z's default),
+    "overwrite" (replace, including split volumes) or "cancel".  Escape and
+    the window-manager X mean cancel.  Non-native for the same reason as
+    _message_box().
+    """
+    shown = 8
+    names = "\n".join(f"• {Path(p).name}" for p in paths[:shown])
+    if len(paths) > shown:
+        names += f"\n…and {len(paths) - shown} more"
+    n = len(paths)
+    box = QMessageBox(parent)
+    box.setOption(QMessageBox.Option.DontUseNativeDialog, True)
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setWindowTitle("Archives Already Exist" if n > 1 else "Archive Already Exists")
+    box.setText(
+        f"{n} of the archives to be created already exist"
+        f"{'s' if n == 1 else ''}:\n\n{names}\n\nWhat would you like to do?"
+    )
+    box.setInformativeText(
+        "Keep Both — save the new archives with -2, -3… added.\n"
+        "Add to Existing — put the files into the existing archives.\n"
+        "Overwrite — replace the existing archives; their current "
+        "contents are lost."
+    )
+    btn_keep = box.addButton("Keep Both",       QMessageBox.ButtonRole.AcceptRole)
+    btn_add  = box.addButton("Add to Existing", QMessageBox.ButtonRole.ActionRole)
+    btn_over = box.addButton("Overwrite",       QMessageBox.ButtonRole.DestructiveRole)
+    btn_canc = box.addButton("Cancel",          QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(btn_keep)
+    box.setEscapeButton(btn_canc)
+    box.exec()
+    return {btn_keep: "keep", btn_add: "add",
+            btn_over: "overwrite"}.get(box.clickedButton(), "cancel")
+
+
 # ═════════════════════════════════════════════════════
 #  Worker Thread
 # ═════════════════════════════════════════════════════
@@ -226,7 +264,7 @@ def _archive_part_paths(path):
 
 
 def _individual_archive_paths(sources, ext, suffix="", ts_prefix=False,
-                              out_dir=""):
+                              out_dir="", avoid_existing=False):
     """Archive path for each source in "one archive per file/folder" mode.
 
     Names drop the file's extension ("report.odt" -> "report.7z"), which used
@@ -238,6 +276,10 @@ def _individual_archive_paths(sources, ext, suffix="", ts_prefix=False,
       2. anything still clashing (e.g. two same-named folders sent to one
          output folder) gets -2, -3, … in selection order.
     Unique names are unchanged.  Returns a list parallel to `sources`.
+
+    avoid_existing=True also treats archives already on disk (including split
+    volumes) as taken, so they get the -2, -3 treatment — the "Keep Both"
+    answer to the existing-archive prompt.
     """
     def build(src, stem):
         name = f"{suffix}{stem}.{ext}" if ts_prefix else f"{stem}{suffix}.{ext}"
@@ -253,7 +295,7 @@ def _individual_archive_paths(sources, ext, suffix="", ts_prefix=False,
     result, taken = [], set()
     for src, stem in zip(sources, stems):
         path, n = build(src, stem), 2
-        while path in taken:
+        while path in taken or (avoid_existing and _archive_part_paths(path)):
             path, n = build(src, f"{stem}-{n}"), n + 1
         taken.add(path)
         result.append(path)
@@ -2499,21 +2541,49 @@ class MainWindow(QMainWindow):
         else:
             suffix = ""
 
-        arc_paths = _individual_archive_paths(
-            sources, ext, suffix=suffix, ts_prefix=ts_prefix,
-            out_dir=indiv_out_dir,
-        )
+        naming = dict(suffix=suffix, ts_prefix=ts_prefix, out_dir=indiv_out_dir)
+        arc_paths = _individual_archive_paths(sources, ext, **naming)
+
+        # Normal mode asks before touching an existing archive; individual mode
+        # used to append to it silently (7z's default), which mixed unrelated
+        # files into an archive whose name no longer described its contents.
+        # Ask once, up front, for the whole batch.
+        overwrite = set()
+        existing = [a for a in arc_paths if _archive_part_paths(a)]
+        if existing:
+            choice = _ask_existing_archives(self, existing)
+            if choice == "cancel":
+                return
+            if choice == "keep":
+                arc_paths = _individual_archive_paths(
+                    sources, ext, avoid_existing=True, **naming)
+            elif choice == "overwrite":
+                overwrite = set(existing)
+
         remaining = len(sources)
         for src, arc_path in zip(sources, arc_paths):
             remaining -= 1
             src_path  = Path(src)
-            ok = self._run_worker(
-                "create", f"Archiving {src_path.name}…",
-                archive=arc_path, sources=[src],
-                level=p["level"], password=p["password"],
-                split_size=p["split_size"], split_unit=p["split_unit"], solid=p["solid"],
-                delete_src=p["delete_src"], excl_hidden=p["excl_hidden"],
-            )
+            ok = True
+            if arc_path in overwrite:
+                # Removed one at a time, right before its replacement is built,
+                # so cancelling part-way leaves the later archives untouched.
+                try:
+                    for _part in _archive_part_paths(arc_path):
+                        os.remove(_part)
+                except OSError as e:
+                    _msg_critical(self, "Error",
+                                  f"Could not remove existing archive:\n{e}")
+                    ok = False
+            if ok:
+                ok = self._run_worker(
+                    "create", f"Archiving {src_path.name}…",
+                    archive=arc_path, sources=[src],
+                    level=p["level"], password=p["password"],
+                    split_size=p["split_size"], split_unit=p["split_unit"],
+                    solid=p["solid"],
+                    delete_src=p["delete_src"], excl_hidden=p["excl_hidden"],
+                )
             if not ok and remaining > 0:
                 answer = _msg_question(
                     self, "Archive Failed",

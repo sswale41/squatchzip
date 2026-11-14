@@ -239,5 +239,107 @@ check("each archive holds only its own file",
 win2.close()
 shutil.rmtree(IA, ignore_errors=True)
 
+print("\n=== 2.3.4: avoid_existing naming ===")
+X = os.path.abspath("t5ex"); shutil.rmtree(X, ignore_errors=True); os.makedirs(X)
+open(f"{X}/a.txt", "w").write("x"); open(f"{X}/b.txt", "w").write("x")
+open(f"{X}/a.7z", "w").write("old")
+check("existing archive -> -2",
+      iap([f"{X}/a.txt"], "7z", avoid_existing=True) == [f"{X}/a-2.7z"])
+open(f"{X}/a-2.7z", "w").write("old")
+check("-2 also taken -> -3",
+      iap([f"{X}/a.txt"], "7z", avoid_existing=True) == [f"{X}/a-3.7z"])
+open(f"{X}/b.7z.001", "w").write("old")
+check("split volumes count as existing",
+      iap([f"{X}/b.txt"], "7z", avoid_existing=True) == [f"{X}/b-2.7z"])
+check("default still ignores what is on disk",
+      iap([f"{X}/a.txt"], "7z") == [f"{X}/a.7z"])
+shutil.rmtree(X, ignore_errors=True)
+
+print("\n=== 2.3.4: existing-archive prompt in individual mode ===")
+def _lst(arc):
+    out = subprocess.run(["7z", "l", "-slt", arc], capture_output=True, text=True,
+                         stdin=subprocess.DEVNULL).stdout
+    return sorted(l[7:] for l in out.splitlines() if l.startswith("Path = ") and l[7:] != arc)
+
+def _scenario(choice, delete=False):
+    """Fresh dir with src a.txt and an existing a.7z holding old.txt."""
+    shutil.rmtree(X, ignore_errors=True); os.makedirs(X)
+    open(f"{X}/old.txt", "w").write("old\n" * 20)
+    subprocess.run(["7z", "a", f"{X}/a.7z", f"{X}/old.txt"], capture_output=True,
+                   stdin=subprocess.DEVNULL)
+    os.remove(f"{X}/old.txt")
+    open(f"{X}/a.txt", "w").write("new\n" * 20)
+    asked = []
+    sz._ask_existing_archives = lambda parent, paths: (asked.append(list(paths)), choice)[1]
+    w = sz.MainWindow(); w._run_worker = _sync_worker; made.clear()
+    w._new_individual({
+        "sources": [f"{X}/a.txt"], "level": 1, "password": "", "split_size": 0,
+        "split_unit": "MB", "solid": True, "delete_src": delete, "excl_hidden": False,
+        "archive": "", "indiv_out_dir": "", "ext": "7z", "ts_idx": 0,
+        "ts_prefix": False, "custom_ts_format": "",
+    })
+    w.close()
+    return asked
+
+_orig_ask = sz._ask_existing_archives
+try:
+    asked = _scenario("cancel")
+    check("prompt lists the existing archive", asked == [[f"{X}/a.7z"]], str(asked))
+    check("cancel: nothing created", made == [], str(made))
+    check("cancel: existing archive untouched", _lst(f"{X}/a.7z") == ["old.txt"],
+          str(_lst(f"{X}/a.7z")))
+    check("cancel: source kept", os.path.exists(f"{X}/a.txt"))
+
+    _scenario("add")
+    check("add: file appended to existing archive",
+          _lst(f"{X}/a.7z") == ["a.txt", "old.txt"], str(_lst(f"{X}/a.7z")))
+
+    _scenario("keep")
+    check("keep both: new archive is a-2.7z", made == [f"{X}/a-2.7z"], str(made))
+    check("keep both: existing archive untouched", _lst(f"{X}/a.7z") == ["old.txt"])
+    check("keep both: new archive holds the file", _lst(f"{X}/a-2.7z") == ["a.txt"])
+
+    _scenario("overwrite", delete=True)
+    check("overwrite: archive replaced", _lst(f"{X}/a.7z") == ["a.txt"],
+          str(_lst(f"{X}/a.7z")))
+    check("overwrite + delete: source removed", not os.path.exists(f"{X}/a.txt"))
+
+    shutil.rmtree(X, ignore_errors=True); os.makedirs(X)
+    open(f"{X}/c.txt", "w").write("x")
+    asked2 = []
+    sz._ask_existing_archives = lambda parent, paths: (asked2.append(paths), "cancel")[1]
+    w = sz.MainWindow(); w._run_worker = _sync_worker; made.clear()
+    w._new_individual({
+        "sources": [f"{X}/c.txt"], "level": 1, "password": "", "split_size": 0,
+        "split_unit": "MB", "solid": True, "delete_src": False, "excl_hidden": False,
+        "archive": "", "indiv_out_dir": "", "ext": "7z", "ts_idx": 0,
+        "ts_prefix": False, "custom_ts_format": "",
+    })
+    w.close()
+    check("no clash: no prompt, archive created",
+          asked2 == [] and made == [f"{X}/c.7z"], f"{asked2} {made}")
+finally:
+    sz._ask_existing_archives = _orig_ask
+
+print("\n=== 2.3.4: the prompt itself ===")
+from PyQt6.QtCore import QTimer
+from PyQt6.QtWidgets import QMessageBox
+def _drive(action):
+    def go():
+        box = app.activeModalWidget()
+        if not isinstance(box, QMessageBox):
+            QTimer.singleShot(20, go); return
+        if action == "escape":
+            box.reject()
+        else:
+            next(b for b in box.buttons() if b.text() == action).click()
+    QTimer.singleShot(20, go)
+for label, want in (("Keep Both", "keep"), ("Add to Existing", "add"),
+                    ("Overwrite", "overwrite"), ("Cancel", "cancel"), ("escape", "cancel")):
+    _drive(label)
+    got = sz._ask_existing_archives(None, [f"/x/{i}.7z" for i in range(10)])
+    check(f"{label} -> {want}", got == want, got)
+shutil.rmtree(X, ignore_errors=True)
+
 print(f"\n{'ALL PASS' if not fails else 'FAILURES: ' + ', '.join(fails)}")
 sys.exit(1 if fails else 0)
