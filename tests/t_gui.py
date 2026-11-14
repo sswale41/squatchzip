@@ -141,5 +141,103 @@ try:
 except Exception as e:
     check("_add_sources_to_archive() on Browse tab", False, f"{type(e).__name__}: {e}")
 
+print("\n=== 2.3.3: _individual_archive_paths ===")
+IA = os.path.abspath("t5ia"); shutil.rmtree(IA, ignore_errors=True)
+os.makedirs(f"{IA}/a/report"); os.makedirs(f"{IA}/b/report"); os.makedirs(f"{IA}/out")
+for f in ("report.odt", "report.pdf", "notes.txt", "Makefile"):
+    open(f"{IA}/a/{f}", "w").write("x")
+iap = sz._individual_archive_paths
+check("unique names unchanged",
+      iap([f"{IA}/a/notes.txt"], "7z") == [f"{IA}/a/notes.7z"])
+check("same stem -> extension kept",
+      iap([f"{IA}/a/report.odt", f"{IA}/a/report.pdf"], "7z")
+      == [f"{IA}/a/report.odt.7z", f"{IA}/a/report.pdf.7z"],
+      str(iap([f"{IA}/a/report.odt", f"{IA}/a/report.pdf"], "7z")))
+check("collision only affects the clashing group",
+      iap([f"{IA}/a/report.odt", f"{IA}/a/report.pdf", f"{IA}/a/notes.txt"], "7z")[2]
+      == f"{IA}/a/notes.7z")
+check("folder keeps plain name, colliding files keep extension",
+      iap([f"{IA}/a/report", f"{IA}/a/report.odt", f"{IA}/a/report.pdf"], "zip")
+      == [f"{IA}/a/report.zip", f"{IA}/a/report.odt.zip", f"{IA}/a/report.pdf.zip"],
+      str(iap([f"{IA}/a/report", f"{IA}/a/report.odt", f"{IA}/a/report.pdf"], "zip")))
+check("same-named folders into one out_dir get -2",
+      iap([f"{IA}/a/report", f"{IA}/b/report"], "7z", out_dir=f"{IA}/out")
+      == [f"{IA}/out/report.7z", f"{IA}/out/report-2.7z"],
+      str(iap([f"{IA}/a/report", f"{IA}/b/report"], "7z", out_dir=f"{IA}/out")))
+check("same-named folders in different parents do not collide",
+      iap([f"{IA}/a/report", f"{IA}/b/report"], "7z")
+      == [f"{IA}/a/report.7z", f"{IA}/b/report.7z"])
+check("timestamp prefix applied after disambiguation",
+      iap([f"{IA}/a/report.odt", f"{IA}/a/report.pdf"], "7z", suffix="20261114_", ts_prefix=True)
+      == [f"{IA}/a/20261114_report.odt.7z", f"{IA}/a/20261114_report.pdf.7z"])
+res = iap([f"{IA}/a/report.odt", f"{IA}/a/report.pdf", f"{IA}/a/notes.txt",
+           f"{IA}/a/Makefile", f"{IA}/a/report"], "7z")
+check("every result path is unique", len(set(res)) == len(res), str(res))
+
+print("\n=== 2.3.3: individual mode keeps the output box a folder ===")
+dlg = sz.CreateArchiveDialog(None, initial_files=[f"{IA}/a/report.odt", f"{IA}/a/report.pdf"])
+check("normal mode auto-fills an archive path", dlg.out_path.text().endswith(".7z"),
+      dlg.out_path.text())
+dlg.indiv_each.setChecked(True)
+check("individual mode clears the box", dlg.out_path.text() == "")
+dlg.fmt.setCurrentIndex((dlg.fmt.currentIndex() + 1) % dlg.fmt.count())
+dlg.ts_pos.setCurrentIndex(1)
+dlg.ts_combo.setCurrentIndex(1)
+check("format/timestamp changes leave the box empty", dlg.out_path.text() == "",
+      dlg.out_path.text())
+dlg.file_list.addItem(f"{IA}/a/notes.txt")
+check("adding a file leaves the box empty", dlg.out_path.text() == "", dlg.out_path.text())
+check("get_params indiv_out_dir is empty", dlg.get_params()["indiv_out_dir"] == "")
+dlg.indiv_each.setChecked(False)
+check("leaving individual mode restores an archive path",
+      dlg.out_path.text().endswith(tuple("." + e for e in sz.FORMATS.values())),
+      dlg.out_path.text())
+
+warned = []
+_orig_warn = sz._msg_warning
+sz._msg_warning = lambda parent, title, text, *a: warned.append(title)
+try:
+    dlg2 = sz.CreateArchiveDialog(None, initial_files=[f"{IA}/a/notes.txt"])
+    dlg2.indiv_each.setChecked(True)
+    dlg2.out_path.setText(f"{IA}/out/missing.7z")
+    dlg2._validate()
+    check("nonexistent output folder is refused",
+          warned == ["Output Folder Not Found"] and dlg2.result() == 0, str(warned))
+    warned.clear()
+    dlg2.out_path.setText(f"{IA}/out")
+    dlg2._validate()
+    check("existing output folder is accepted", warned == [] and dlg2.result() == 1,
+          str(warned))
+finally:
+    sz._msg_warning = _orig_warn
+
+print("\n=== 2.3.3: individual + delete originals end to end ===")
+E = f"{IA}/docs"; os.makedirs(E)
+for f in ("itinerary.odt", "itinerary.pdf", "guide.odt", "guide.pdf"):
+    open(f"{E}/{f}", "w").write(f * 40)
+win2 = sz.MainWindow()
+made = []
+def _sync_worker(op, title, _on_success=None, **kw):
+    w = sz.ArchiveWorker(op, **kw); r = {}
+    w.op_finished.connect(lambda ok, msg: r.update(ok=ok))
+    w.run(); made.append(kw["archive"]); return r.get("ok")
+win2._run_worker = _sync_worker
+win2._new_individual({
+    "sources": [f"{E}/itinerary.odt", f"{E}/itinerary.pdf", f"{E}/guide.odt", f"{E}/guide.pdf"],
+    "level": 1, "password": "", "split_size": 0, "split_unit": "MB", "solid": True,
+    "delete_src": True, "excl_hidden": True, "archive": "", "indiv_out_dir": "",
+    "ext": "7z", "ts_idx": 0, "ts_prefix": False, "custom_ts_format": "",
+})
+check("4 files -> 4 archives", sorted(os.listdir(E)) ==
+      ["guide.odt.7z", "guide.pdf.7z", "itinerary.odt.7z", "itinerary.pdf.7z"],
+      str(sorted(os.listdir(E))))
+check("no extra folder created", all(os.path.isfile(f"{E}/{n}") for n in os.listdir(E)))
+one = subprocess.run(["7z", "l", "-slt", f"{E}/guide.pdf.7z"], capture_output=True,
+                     text=True, stdin=subprocess.DEVNULL).stdout
+check("each archive holds only its own file",
+      "Path = guide.pdf" in one and "Path = guide.odt" not in one)
+win2.close()
+shutil.rmtree(IA, ignore_errors=True)
+
 print(f"\n{'ALL PASS' if not fails else 'FAILURES: ' + ', '.join(fails)}")
 sys.exit(1 if fails else 0)

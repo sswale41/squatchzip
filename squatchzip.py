@@ -36,7 +36,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QAction, QIcon, QFont, QDragEnterEvent, QDropEvent, QCursor, QFileSystemModel, QPixmap
 
 # ─────────────────────────────────────────────────────
-VERSION  = "2.3.2"
+VERSION  = "2.3.3"
 APP_NAME = "SquatchZip"
 ORG_NAME = "SquatchLabs"
 
@@ -223,6 +223,41 @@ def _archive_part_paths(path):
     stem = path[:-4] if path.lower().endswith(".rar") else path
     paths += sorted(glob.glob(f"{stem}.part*.rar"))
     return paths
+
+
+def _individual_archive_paths(sources, ext, suffix="", ts_prefix=False,
+                              out_dir=""):
+    """Archive path for each source in "one archive per file/folder" mode.
+
+    Names drop the file's extension ("report.odt" -> "report.7z"), which used
+    to send "report.odt" and "report.pdf" to the same path — 7z then appended
+    the second file to the first file's archive.  Collisions are now resolved
+    so every source gets its own archive:
+      1. files in a colliding group keep their extension (report.odt.7z,
+         report.pdf.7z); folders keep their plain name;
+      2. anything still clashing (e.g. two same-named folders sent to one
+         output folder) gets -2, -3, … in selection order.
+    Unique names are unchanged.  Returns a list parallel to `sources`.
+    """
+    def build(src, stem):
+        name = f"{suffix}{stem}.{ext}" if ts_prefix else f"{stem}{suffix}.{ext}"
+        return str(Path(out_dir or Path(src).parent) / name)
+
+    is_dir = [os.path.isdir(s) for s in sources]
+    stems = [Path(s).name if d else Path(s).stem for s, d in zip(sources, is_dir)]
+    first = [build(s, st) for s, st in zip(sources, stems)]
+    clashing = {p for p in first if first.count(p) > 1}
+    stems = [Path(s).name if (p in clashing and not d) else st
+             for s, d, st, p in zip(sources, is_dir, stems, first)]
+
+    result, taken = [], set()
+    for src, stem in zip(sources, stems):
+        path, n = build(src, stem), 2
+        while path in taken:
+            path, n = build(src, f"{stem}-{n}"), n + 1
+        taken.add(path)
+        result.append(path)
+    return result
 
 
 def _find_hidden(sources, limit=3):
@@ -1209,6 +1244,12 @@ class CreateArchiveDialog(QDialog):
         return Path(name).stem
 
     def _rebuild_outpath(self, _=None):
+        # In individual mode the box holds an optional output *folder*.  Writing
+        # a single-archive path into it here (on every format/timestamp change)
+        # made _new_individual use "…/name.7z" as the output folder, and 7z
+        # silently created a directory by that name.
+        if self.indiv_each.isChecked():
+            return
         ext = FORMATS[self.fmt.currentText()]
         ts = self.ts_combo.currentIndex()
         if ts == 1:
@@ -1267,6 +1308,17 @@ class CreateArchiveDialog(QDialog):
             return
 
         out = self.out_path.text().strip()
+        # Individual mode: a typed output folder must already be a folder.  7z
+        # creates missing parent directories on its own, so a typo (or a file
+        # path) would otherwise become a brand-new folder without a word.
+        if self.indiv_each.isChecked() and out and not os.path.isdir(out):
+            _msg_warning(
+                self, "Output Folder Not Found",
+                f"“{out}” is not an existing folder.\n\n"
+                "Choose a folder with “Output Folder…”, or leave the "
+                "box empty to save each archive next to its source."
+            )
+            return
         # Only check for existing archive file in normal (non-individual) mode.
         # In individual mode the per-file archive paths aren't known yet.
         if not self.indiv_each.isChecked() and os.path.exists(out):
@@ -2447,15 +2499,14 @@ class MainWindow(QMainWindow):
         else:
             suffix = ""
 
+        arc_paths = _individual_archive_paths(
+            sources, ext, suffix=suffix, ts_prefix=ts_prefix,
+            out_dir=indiv_out_dir,
+        )
         remaining = len(sources)
-        for src in sources:
+        for src, arc_path in zip(sources, arc_paths):
             remaining -= 1
             src_path  = Path(src)
-            stem      = src_path.name if src_path.is_dir() else src_path.stem
-            arc_name  = (f"{suffix}{stem}.{ext}" if ts_prefix
-                         else f"{stem}{suffix}.{ext}")
-            out_dir   = indiv_out_dir if indiv_out_dir else str(src_path.parent)
-            arc_path  = str(Path(out_dir) / arc_name)
             ok = self._run_worker(
                 "create", f"Archiving {src_path.name}…",
                 archive=arc_path, sources=[src],
